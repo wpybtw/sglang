@@ -16,7 +16,7 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union, List
 
 import torch
 from torch import nn
@@ -473,9 +473,14 @@ class Qwen2ForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
-                return self.logits_processor(
-                    input_ids, hidden_states, self.lm_head, forward_batch
-                )
+                if type(hidden_states) is tuple:
+                    return self.logits_processor(
+                        input_ids, hidden_states[0], self.lm_head, forward_batch, hidden_states[1]
+                    )
+                else:
+                    return self.logits_processor(
+                        input_ids, hidden_states, self.lm_head, forward_batch
+                    )
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
@@ -599,6 +604,18 @@ class Qwen2ForCausalLM(nn.Module):
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
 
+    def set_embed(self, embed):
+        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -613,5 +630,19 @@ class Qwen2ForCausalLM(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.layers_to_capture = [16, 40, 62]
 
 EntryClass = Qwen2ForCausalLM
